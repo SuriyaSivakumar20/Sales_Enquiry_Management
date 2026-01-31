@@ -1,15 +1,15 @@
 import { User, Customer, AnyPlan, Organization, Attachment, UserRole } from '../types';
 import { db as firestore, auth, storage, firebaseConfig } from './firebaseConfig';
-import { 
-  collection, getDocs, doc, setDoc, updateDoc
+import {
+  collection, getDocs, doc, setDoc, updateDoc, onSnapshot
 } from 'firebase/firestore';
-import { 
-  ref, uploadString, getDownloadURL 
+import {
+  ref, uploadString, getDownloadURL
 } from 'firebase/storage';
 import { signInWithEmailAndPassword } from 'firebase/auth';
 
 /**
- * DATABASE SERVICE
+ * DATABASE SERVICE - ONLINE ONLY
  */
 
 interface AppData {
@@ -28,136 +28,99 @@ const INITIAL_DATA: AppData = {
 
 // Helper to sanitize Firestore data
 const sanitizeDoc = (data: any): any => {
-    if (!data) return data;
-    if (typeof data !== 'object') return data;
-    if (Array.isArray(data)) return data.map(sanitizeDoc);
-    if (data.toDate && typeof data.toDate === 'function') {
-        return data.toDate().toISOString();
-    }
-    if (data.firestore && data.path) {
-        return data.path; 
-    }
-    const clean: any = {};
-    Object.keys(data).forEach(key => {
-        clean[key] = sanitizeDoc(data[key]);
-    });
-    return clean;
+  if (!data) return data;
+  if (typeof data !== 'object') return data;
+  if (Array.isArray(data)) return data.map(sanitizeDoc);
+  if (data.toDate && typeof data.toDate === 'function') {
+    return data.toDate().toISOString();
+  }
+  if (data.firestore && data.path) {
+    return data.path;
+  }
+  const clean: any = {};
+  Object.keys(data).forEach(key => {
+    clean[key] = sanitizeDoc(data[key]);
+  });
+  return clean;
 };
 
 class DatabaseService {
   private data: AppData;
   private initialized: boolean = false;
-  private isOffline: boolean = false;
+
+  // Track synchronization status
+  public isOnline: boolean = false;
+
+  private listeners: (() => void)[] = [];
+  private subscribers: (() => void)[] = [];
 
   constructor() {
     this.data = INITIAL_DATA;
   }
 
+  // Allow React components to listen for data changes
+  public subscribe(callback: () => void): () => void {
+    this.subscribers.push(callback);
+    return () => {
+      this.subscribers = this.subscribers.filter(cb => cb !== callback);
+    };
+  }
+
+  private notifySubscribers() {
+    this.subscribers.forEach(cb => cb());
+  }
+
   async init() {
     if (this.initialized) return;
 
-    // If config is missing entirely, go offline immediately
+    // Strict Online Check
     if (!firebaseConfig || Object.keys(firebaseConfig).length === 0) {
-        console.warn("No Firebase Config found. Starting in Offline Mode.");
-        this.isOffline = true;
-        this.loadFromLocal();
-        this.initialized = true;
-        this.ensureSuperAdmin();
-        return;
+      this.isOnline = false;
+      throw new Error("Missing Firebase Configuration. App cannot start in online mode.");
     }
 
     try {
-      console.log("Attempting to sync data from Cloud...");
-      
-      // Use Modular SDK getDocs
-      const [orgsSnap, usersSnap, custSnap, plansSnap] = await Promise.all([
-        getDocs(collection(firestore, 'organizations')),
-        getDocs(collection(firestore, 'users')),
-        getDocs(collection(firestore, 'customers')),
-        getDocs(collection(firestore, 'plans'))
-      ]);
+      console.log("Connecting onto Cloud Database...");
 
-      this.data.organizations = orgsSnap.docs.map(d => sanitizeDoc(d.data()) as Organization);
-      this.data.users = usersSnap.docs.map(d => sanitizeDoc(d.data()) as User);
-      this.data.customers = custSnap.docs.map(d => sanitizeDoc(d.data()) as Customer);
-      this.data.plans = plansSnap.docs.map(d => sanitizeDoc(d.data()) as AnyPlan);
+      this.isOnline = true;
 
-      this.isOffline = false;
-      console.log("Cloud Sync Complete. Online Mode.");
-    } catch (e: any) {
-      console.warn("Cloud connection failed. Switching to Offline Mode.", e.message || e);
-      this.isOffline = true;
-      this.loadFromLocal();
-    } finally {
+      // Set up real-time listeners
+      const unsubOrgs = onSnapshot(collection(firestore, 'organizations'), (snap) => {
+        this.data.organizations = snap.docs.map(d => sanitizeDoc(d.data()) as Organization);
+        this.notifySubscribers();
+      });
+
+      const unsubUsers = onSnapshot(collection(firestore, 'users'), (snap) => {
+        this.data.users = snap.docs.map(d => sanitizeDoc(d.data()) as User);
+        this.notifySubscribers();
+      });
+
+      const unsubCust = onSnapshot(collection(firestore, 'customers'), (snap) => {
+        this.data.customers = snap.docs.map(d => sanitizeDoc(d.data()) as Customer);
+        this.notifySubscribers();
+      });
+
+      const unsubPlans = onSnapshot(collection(firestore, 'plans'), (snap) => {
+        this.data.plans = snap.docs.map(d => sanitizeDoc(d.data()) as AnyPlan);
+        this.notifySubscribers();
+      });
+
+      this.listeners.push(unsubOrgs, unsubUsers, unsubCust, unsubPlans);
+
       this.initialized = true;
-      this.ensureSuperAdmin();
-    }
-  }
-
-  public isOfflineMode(): boolean {
-      return this.isOffline;
-  }
-
-  private ensureSuperAdmin() {
-    const superEmail = 'keerthithiruvarasan@gmail.com';
-    const altEmail = 'keerthithiruvarsan@gmail.com';
-    
-    const exists = this.data.users.find(u => 
-        (u.email === superEmail || u.email === altEmail) && 
-        u.role === UserRole.SUPER_ADMIN
-    );
-
-    if (!exists) {
-        this.data.users.push({
-            id: 'super_admin_session',
-            name: 'Keerthi (Super Admin)',
-            email: superEmail,
-            password: '123456789@Asdf', 
-            role: UserRole.SUPER_ADMIN,
-            organizationId: 'system_global',
-            organizationName: 'System',
-            isApproved: true
-        });
-    }
-  }
-
-  private loadFromLocal() {
-    const saved = localStorage.getItem('sales_tracker_offline_data');
-    if (saved) {
-      try {
-        this.data = JSON.parse(saved);
-      } catch (e) {
-        console.error("Corrupt local data", e);
-        this.seedOfflineData();
-      }
-    } else {
-      this.seedOfflineData();
-    }
-  }
-
-  private seedOfflineData() {
-    this.data = {
-      organizations: [],
-      customers: [],
-      plans: [],
-      users: [] 
-    };
-    this.saveToLocal();
-  }
-
-  private saveToLocal() {
-    if (this.isOffline) {
-      try {
-          localStorage.setItem('sales_tracker_offline_data', JSON.stringify(this.data));
-      } catch (e) {
-          console.error("Failed to save local data", e);
-      }
+      console.log("Online Sync Complete. Listening for changes...");
+    } catch (e: any) {
+      console.error("Cloud connection failed:", e);
+      this.isOnline = false;
+      throw new Error("Failed to connect to backend server. Please check internet connection.");
     }
   }
 
   private async uploadAttachments(attachments?: Attachment[]): Promise<Attachment[]> {
     if (!attachments || attachments.length === 0) return [];
-    if (this.isOffline) return attachments;
+
+    // Strict online check for uploads
+    if (!this.isOnline) throw new Error("Cannot upload files while offline");
 
     const uploaded: Attachment[] = [];
     for (const file of attachments) {
@@ -167,17 +130,16 @@ class DatabaseService {
       }
 
       const path = `attachments/${Date.now()}_${file.name}`;
-      // Use Modular SDK storage ref
       // @ts-ignore
       const storageRef = ref(storage, path);
-      
+
       try {
         await uploadString(storageRef, file.data, 'data_url');
         const url = await getDownloadURL(storageRef);
         uploaded.push({ ...file, data: url });
       } catch (e) {
         console.error("File upload failed", e);
-        uploaded.push(file); 
+        throw e; // Fail hard on upload error
       }
     }
     return uploaded;
@@ -192,96 +154,52 @@ class DatabaseService {
   // --- WRITE METHODS ---
 
   async addOrganization(org: Organization) {
+    // 1. Write to Cloud first
+    await setDoc(doc(firestore, 'organizations', org.id), org);
+    // 2. Update local state only on success
     this.data.organizations.push(org);
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await setDoc(doc(firestore, 'organizations', org.id), org);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async updateOrganization(id: string, updates: Partial<Organization>) {
+    await updateDoc(doc(firestore, 'organizations', id), updates);
     this.data.organizations = this.data.organizations.map(o => o.id === id ? { ...o, ...updates } : o);
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await updateDoc(doc(firestore, 'organizations', id), updates);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async addUser(user: User) {
+    await setDoc(doc(firestore, 'users', user.id), user);
     this.data.users.push(user);
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await setDoc(doc(firestore, 'users', user.id), user);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async updateUser(userId: string, updates: Partial<User>) {
+    await updateDoc(doc(firestore, 'users', userId), updates);
     this.data.users = this.data.users.map(u => u.id === userId ? { ...u, ...updates } : u);
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await updateDoc(doc(firestore, 'users', userId), updates);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async addCustomer(customer: Customer) {
+    await setDoc(doc(firestore, 'customers', customer.id), customer);
     this.data.customers.push(customer);
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await setDoc(doc(firestore, 'customers', customer.id), customer);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async addPlan(plan: AnyPlan) {
     const processedAttachments = await this.uploadAttachments(plan.attachments);
     const planToSave = { ...plan, attachments: processedAttachments };
 
+    await setDoc(doc(firestore, 'plans', plan.id), planToSave);
     this.data.plans.push(planToSave);
-
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await setDoc(doc(firestore, 'plans', plan.id), planToSave);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async updatePlan(planId: string, updates: Partial<AnyPlan>) {
     if (updates.attachments) {
-        updates.attachments = await this.uploadAttachments(updates.attachments);
+      updates.attachments = await this.uploadAttachments(updates.attachments);
     }
-    this.data.plans = this.data.plans.map(p => 
+    await updateDoc(doc(firestore, 'plans', planId), updates);
+    this.data.plans = this.data.plans.map(p =>
       p.id === planId ? { ...p, ...updates } as AnyPlan : p
     );
-    if (this.isOffline) {
-      this.saveToLocal();
-    } else {
-      try {
-        await updateDoc(doc(firestore, 'plans', planId), updates);
-      } catch (e) { this.isOffline = true; this.saveToLocal(); }
-    }
   }
 
   async login(email: string, pass: string) {
-     if (this.isOffline) {
-       return Promise.reject("Offline mode: Use local data validation");
-     }
-     return signInWithEmailAndPassword(auth, email, pass);
+    return signInWithEmailAndPassword(auth, email, pass);
   }
 }
 
